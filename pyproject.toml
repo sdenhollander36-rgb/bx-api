@@ -1,2 +1,12 @@
+[project]
+name = "bx-api"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "yfinance",
+    "pandas",
+    "numpy",
+]
+
 [tool.vercel]
 entrypoint = "api.bx:handler"
