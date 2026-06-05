@@ -1,8 +1,13 @@
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 import json
+import time
 import yfinance as yf
 import pandas as pd
+
+# ── In-memory cache (persists across requests on same worker) ──
+_cache = {}
+CACHE_TTL = 900  # 15 minutes
 
 def tv_ema(series, period):
     alpha = 2 / (period + 1)
@@ -38,6 +43,12 @@ def calc_fvb(df, period=33):
     return df["Low"].squeeze() > middle
 
 def get_bx(ticker):
+    # Check cache first
+    if ticker in _cache:
+        cached = _cache[ticker]
+        if time.time() - cached['ts'] < CACHE_TTL:
+            return cached['data']
+
     df_w = yf.download(ticker, period="max", interval="1wk",
                        progress=False, auto_adjust=False, threads=False)
     df_m = yf.download(ticker, period="max", interval="1mo",
@@ -60,21 +71,38 @@ def get_bx(ticker):
     fvb_m_cur  = bool(fvb_m.iloc[-1])
     price      = float(df_w["Close"].squeeze().iloc[-1])
 
-    return {
-        "ticker":           ticker,
-        "wbx":              round(wbx_cur, 2),
-        "wbx_prev":         round(wbx_prev, 2),
-        "mbx":              round(mbx_cur, 2),
-        "mbx_prev":         round(mbx_prev, 2),
-        "fvb_w":            fvb_w_cur,
-        "fvb_w_prev":       fvb_w_prev,
-        "fvb_m":            fvb_m_cur,
-        "wbx_green":        wbx_cur > 0,
-        "fvb_green":        fvb_w_cur,
-        "mbx_green":        mbx_cur > 0,
-        "mbx_flipped_red":  mbx_cur < 0 and mbx_prev >= 0,
-        "price":            round(price, 2),
+    # Also get today's change from daily data
+    df_d = yf.download(ticker, period="5d", interval="1d",
+                       progress=False, auto_adjust=False, threads=False)
+    change_pct = 0.0
+    if df_d is not None and len(df_d) >= 2:
+        closes_d = df_d["Close"].squeeze()
+        cur  = float(closes_d.iloc[-1])
+        prev = float(closes_d.iloc[-2])
+        price = cur  # use daily close for more accurate price
+        change_pct = round((cur - prev) / prev * 100, 2) if prev > 0 else 0.0
+
+    result = {
+        "ticker":          ticker,
+        "wbx":             round(wbx_cur, 2),
+        "wbx_prev":        round(wbx_prev, 2),
+        "mbx":             round(mbx_cur, 2),
+        "mbx_prev":        round(mbx_prev, 2),
+        "fvb_w":           fvb_w_cur,
+        "fvb_w_prev":      fvb_w_prev,
+        "fvb_m":           fvb_m_cur,
+        "wbx_green":       wbx_cur > 0,
+        "fvb_green":       fvb_w_cur,
+        "mbx_green":       mbx_cur > 0,
+        "mbx_flipped_red": mbx_cur < 0 and mbx_prev >= 0,
+        "price":           round(price, 2),
+        "change_pct":      change_pct,
+        "cached":          False,
     }
+
+    # Store in cache
+    _cache[ticker] = {'data': result, 'ts': time.time()}
+    return result
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -85,6 +113,8 @@ class handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
+        # Tell browser to cache for 15 minutes too
+        self.send_header("Cache-Control", "public, max-age=900")
         self.end_headers()
 
         if not ticker:
@@ -93,6 +123,7 @@ class handler(BaseHTTPRequestHandler):
         try:
             result = get_bx(ticker.upper())
             if result:
+                result['cached'] = ticker.upper() in _cache
                 self.wfile.write(json.dumps(result).encode())
             else:
                 self.wfile.write(json.dumps({"error": "Not enough data"}).encode())
